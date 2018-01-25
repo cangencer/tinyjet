@@ -17,11 +17,9 @@
 package com.hazelcast.jet;
 
 import com.hazelcast.jet.aggregate.AggregateOperation1;
-import com.hazelcast.jet.aggregate.AggregateOperations;
 import com.hazelcast.jet.core.AppendableTraverser;
 import com.hazelcast.jet.datamodel.Tuple2;
 
-import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,41 +31,44 @@ import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import static com.hazelcast.jet.Util.entry;
 import static com.hazelcast.jet.aggregate.AggregateOperations.allOf;
 import static com.hazelcast.jet.aggregate.AggregateOperations.counting;
 import static com.hazelcast.jet.aggregate.AggregateOperations.groupingBy;
 import static com.hazelcast.jet.datamodel.Tuple2.tuple2;
-import static com.hazelcast.jet.function.DistributedFunctions.wholeItem;
-import static java.util.Comparator.comparingDouble;
 
 public class MarkovChainGenerator {
 
-    public static final String INPUT_FILE = "books";
-    public static final int CONSTANT_KEY = 1;
-
+    private static final String INPUT_FILE = "books";
     private static final Random RANDOM = new Random();
 
     public static void main(String[] args) {
-        SortedMap<Double, String> initialStates = findInitialStates();
-        Map<String, SortedMap<Double, String>> transitions = findStateTransitions();
+        Map<String, SortedMap<Double, String>> stateTransitions = findStateTransitions();
+        printTransitions(stateTransitions);
 
+        // calculate cumulative initial state probabilities
+        String chain = generateMarkovChain(1000, stateTransitions);
+        System.out.println(chain);
+    }
+
+    private static String generateMarkovChain(int length, Map<String, SortedMap<Double, String>> transitions) {
         StringBuilder builder = new StringBuilder();
-        String word = nextWord(initialStates);
+        String word = nextWord(transitions.get("."));
         builder.append(capitalizeFirst(word));
-        int numWordsInSentence = 0;
-        for (int i = 0; i < 1000; i++) {
+        for (int i = 0; i < length; i++) {
             SortedMap<Double, String> t = transitions.get(word);
-            if (t == null || ++numWordsInSentence > 30) {
-                word = nextWord(initialStates);
+            if (t == null) {
+                word = nextWord(transitions.get("."));
                 builder.append(". ").append(capitalizeFirst(word));
-                numWordsInSentence = 0;
             } else {
                 word = nextWord(t);
-                builder.append(" ").append(word);
+                if (word.equals(".")) {
+                    builder.append(word);
+                } else {
+                    builder.append(" ").append(word);
+                }
             }
         }
-        System.out.println(builder);
+        return builder.toString();
     }
 
     private static String nextWord(SortedMap<Double, String> transitions) {
@@ -78,50 +79,16 @@ public class MarkovChainGenerator {
         return word.substring(0, 1).toUpperCase() + word.substring(1);
     }
 
-    private static SortedMap<Double, String> findInitialStates() {
-        Map<String, Double> initialStateTransitions = new HashMap<>();
-        Pattern firstWord = Pattern.compile("\\.\\s([a-z]+)");
-        Pipeline p = Pipeline.create();
-        ComputeStage<Entry<String, Long>> initialWords
-                = p.drawFrom(Sources.<String>files(INPUT_FILE))
-                   .flatMap(e -> traverseMatcher(firstWord.matcher(e.toLowerCase()), m -> m.group(1)))
-                   .groupBy(wholeItem(), counting());
-
-        ComputeStage<Long> totalWords = initialWords
-                .groupBy(e -> "total", AggregateOperations.summingLong(Entry::getValue))
-                .map(Entry::getValue);
-
-        initialWords
-                .hashJoin(totalWords, JoinClause.onKeys(e -> CONSTANT_KEY, e -> CONSTANT_KEY))
-                .map(t -> entry(t.f0().getKey(), t.f0().getValue() / (double) t.f1()))
-                .drainTo(Sinks.map(initialStateTransitions));
-        p.run();
-        printInitialStates(initialStateTransitions);
-
-        // find cumulative probabilities
-        double cumulative = 0;
-        TreeMap<Double, String> probabilities = new TreeMap<>();
-        for (Entry<String, Double> entry : initialStateTransitions.entrySet()) {
-            cumulative += entry.getValue();
-            probabilities.put(cumulative, entry.getKey());
-        }
-        return probabilities;
-    }
-
     private static Map<String, SortedMap<Double, String>> findStateTransitions() {
         Map<String, SortedMap<Double, String>> stateTransitions = new HashMap<>();
-
-        Pattern twoWords = Pattern.compile("(\\w+)\\s(\\w+)");
         Pipeline p = Pipeline.create();
-
-        p.drawFrom(Sources.<String>files(INPUT_FILE, StandardCharsets.UTF_8, "edgar*"))
-         .flatMap(e -> traverseMatcher(twoWords.matcher(e.toLowerCase()), m -> tuple2(m.group(1), m.group(2))))
-         .groupBy(Tuple2::f0, buildAggregateOp())
-         .drainTo(Sinks.map(stateTransitions));
-
+        ComputeStage<String> lines = p.drawFrom(Sources.<String>files(INPUT_FILE));
+        Pattern twoWords = Pattern.compile("(\\.|\\w+)\\s(\\.|\\w+)");
+        lines.flatMap(e -> traverseMatcher(twoWords.matcher(e.toLowerCase()), m -> tuple2(m.group(1), m.group(2))))
+             .groupBy(Tuple2::f0, buildAggregateOp())
+             .drainTo(Sinks.map(stateTransitions));
+        System.out.println("Generating model...");
         p.run();
-
-        printStateTransitions(stateTransitions);
         return stateTransitions;
     }
 
@@ -144,32 +111,18 @@ public class MarkovChainGenerator {
         }));
     }
 
-    private static void printInitialStates(Map<String, Double> initialState) {
-        final int limit = 10;
-        System.out.format(" Top initial %d words are:%n", limit);
+    private static void printTransitions(Map<String, SortedMap<Double, String>> counts) {
+        counts.entrySet().stream().limit(10).forEach(e -> printTransitions(e.getKey(), e.getValue()));
+    }
+
+    private static void printTransitions(String key, SortedMap<Double, String> probabilities) {
+        System.out.println("Transitions for: " + key);
         System.out.println("/-------------+-------------\\");
         System.out.println("| Probability | Word        |");
         System.out.println("|-------------+-------------|");
-        initialState.entrySet().stream()
-                    .sorted(comparingDouble(Entry<String, Double>::getValue).reversed())
-                    .limit(limit)
-                    .forEach(e -> System.out.format("|  %.4f     | %-12s|%n", e.getValue(), e.getKey()));
+        probabilities.forEach((p, w) -> System.out.format("|  %.4f     | %-12s|%n", p, w));
         System.out.println("\\-------------+-------------/");
     }
-
-    private static void printStateTransitions(Map<String, SortedMap<Double, String>> counts) {
-        counts.entrySet().stream().limit(10).forEach(e -> {
-            System.out.println("Transitions for: " + e.getKey());
-            System.out.println("/-------------+-------------\\");
-            System.out.println("| Probability | Word        |");
-            System.out.println("|-------------+-------------|");
-            e.getValue().entrySet().forEach(ee -> {
-                System.out.format("|  %.4f     | %-12s|%n", ee.getKey(), ee.getValue());
-            });
-            System.out.println("\\-------------+-------------/");
-        });
-    }
-
 
     private static <R> Traverser<R> traverseMatcher(Matcher m, Function<Matcher, R> mapperFn) {
         AppendableTraverser<R> traverser = new AppendableTraverser<>(1);

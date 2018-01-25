@@ -110,7 +110,7 @@ public class WordCountLocal {
         measure.getAsLong();
 
         List<Long> timings = new ArrayList<>();
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < 5; i++) {
             timings.add(measure.getAsLong());
         }
         LongSummaryStatistics summary = timings.stream().collect(summarizingLong(x -> x));
